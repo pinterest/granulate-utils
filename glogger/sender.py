@@ -156,12 +156,14 @@ class Sender:
     
     def _refresh_session(self) -> None:
         """Refresh the TLS session by recreating it. Thread-safe."""
+        old_session = self.session
         try:
-            old_session = self.session
             self._init_session()
             # Close old session after new one is established
             old_session.close()
         except Exception as e:
+            # Restore old session if refresh failed
+            self.session = old_session
             self.stdout_logger.error(
                 f"glogger.Sender: Failed to refresh TLS session: {e}. Will retry on next interval."
             )
