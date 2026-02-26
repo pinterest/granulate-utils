@@ -69,6 +69,11 @@ class Sender:
         send_min_interval: float = 10.0,
         max_send_tries: int = 3,
         verify: bool = True,
+        tls_client_cert: Optional[str] = None,
+        tls_client_key: Optional[str] = None,
+        tls_ca_bundle: Optional[str] = None,
+        tls_cert_refresh_enabled: bool = False,
+        tls_cert_refresh_interval: int = 21600,
     ):
         """
         Create a new Sender and start flushing log messages in a background thread.
@@ -81,28 +86,38 @@ class Sender:
         :param send_threshold: Force send when buffer utilization reaches this percentage.
         :param send_min_interval: The minimal interval between each sends.
         :param max_send_tries: Number of times to retry sending a batch if sending fails.
+        :param verify: Whether to verify server certificates (True/False).
+        :param tls_client_cert: Path to client certificate file for mTLS (PEM format).
+        :param tls_client_key: Path to client private key file for mTLS (PEM format).
+        :param tls_ca_bundle: Path to CA bundle file for verifying server certificates (PEM format).
+        :param tls_cert_refresh_enabled: Enable periodic TLS certificate refresh.
+        :param tls_cert_refresh_interval: Interval in seconds for certificate refresh.
         """
 
         self.application_name = application_name
         self.send_interval = send_interval
         self.send_threshold = send_threshold
         self.send_min_interval = send_min_interval
+        self.auth = auth
+        self.verify = verify
+        self.tls_client_cert = tls_client_cert
+        self.tls_client_key = tls_client_key
+        self.tls_ca_bundle = tls_ca_bundle
+        self.tls_cert_refresh_enabled = tls_cert_refresh_enabled
+        self.tls_cert_refresh_interval = tls_cert_refresh_interval
 
         self.max_send_tries = max_send_tries
         self.stdout_logger = get_stdout_logger()
         self.set_address(server_address, scheme=scheme)
         self.jsonify = JSONEncoder(separators=(",", ":"), default=repr).encode  # compact, no whitespace
-        self.session = Session()
+        
+        # Initialize session
+        self._init_session()
 
-        # Set up auth
-        if isinstance(auth, BasicAuthCredentials):
-            self.session.auth = HTTPBasicAuth(*auth)
-        elif isinstance(auth, AuthToken):
-            self.session.headers["X-Token"] = str(auth)
-
-        self.session.verify = verify
         self.messages_buffer: Optional[MessagesBuffer] = None
         self.metadata_callback: Callable[[], Dict] = lambda: {}
+        self._refresh_thread: Optional[threading.Thread] = None
+        self._refresh_stop_event = threading.Event()
 
     def set_address(self, server_address: str, *, scheme: str = "https") -> None:
         """
@@ -111,6 +126,68 @@ class Sender:
         :param scheme: The scheme to use as string ('http' or 'https')
         """
         self.server_uri = f"{scheme}://{server_address}/api/v1/logs"
+    
+    def _init_session(self) -> None:
+        """Initialize or reinitialize the requests session with TLS configuration."""
+        self.session = Session()
+
+        # Set up auth
+        if isinstance(self.auth, BasicAuthCredentials):
+            self.session.auth = HTTPBasicAuth(*self.auth)
+        elif isinstance(self.auth, AuthToken):
+            self.session.headers["X-Token"] = str(self.auth)
+
+        # Configure server certificate verification
+        if self.tls_ca_bundle:
+            # Use custom CA bundle if provided
+            self.session.verify = self.tls_ca_bundle
+        else:
+            # Use default verify setting (True/False or system CA bundle)
+            self.session.verify = self.verify
+        
+        # Configure client certificate for mTLS
+        if self.tls_client_cert and self.tls_client_key:
+            self.session.cert = (self.tls_client_cert, self.tls_client_key)
+        elif self.tls_client_cert or self.tls_client_key:
+            self.stdout_logger.warning(
+                "glogger.Sender: Both tls_client_cert and tls_client_key must be provided for mTLS. "
+                "Ignoring partial configuration."
+            )
+    
+    def _refresh_session(self) -> None:
+        """Refresh the TLS session by recreating it. Thread-safe."""
+        old_session = self.session
+        try:
+            self._init_session()
+            # Close old session after new one is established
+            old_session.close()
+        except Exception as e:
+            # Restore old session if refresh failed
+            self.session = old_session
+            self.stdout_logger.error(
+                f"glogger.Sender: Failed to refresh TLS session: {e}. Will retry on next interval."
+            )
+    
+    def _cert_refresh_loop(self) -> None:
+        """Background thread loop for periodic certificate refresh."""
+        while not self._refresh_stop_event.wait(self.tls_cert_refresh_interval):
+            self._refresh_session()
+    
+    def _start_cert_refresh_thread(self) -> None:
+        """Start the background thread for certificate refresh."""
+        if self._refresh_thread is None or not self._refresh_thread.is_alive():
+            self._refresh_thread = threading.Thread(
+                target=self._cert_refresh_loop,
+                daemon=True,
+                name="gLogger-CertRefresh"
+            )
+            self._refresh_thread.start()
+    
+    def _stop_cert_refresh(self) -> None:
+        """Stop the certificate refresh thread."""
+        if self._refresh_thread and self._refresh_thread.is_alive():
+            self._refresh_stop_event.set()
+            self._refresh_thread.join(timeout=5)
 
     def start(self, messages_buffer: MessagesBuffer, metadata_callback: Callable[[], Dict]) -> None:
         assert self.messages_buffer is None, "Call start once"
@@ -121,6 +198,10 @@ class Sender:
         self.stop_event = threading.Event()
         self.sending_thread = threading.Thread(target=self._send_loop, daemon=True, name="gLogger Logs Sending Thread")
         self.sending_thread.start()
+        
+        # Start certificate refresh thread if enabled
+        if self.tls_cert_refresh_enabled and (self.tls_client_cert or self.tls_ca_bundle):
+            self._start_cert_refresh_thread()
 
     def stop(self, timeout: float = 10) -> bool:
         """
@@ -132,6 +213,7 @@ class Sender:
             return True
         else:
             self.stop_event.set()
+            self._stop_cert_refresh()  # Stop cert refresh thread if running
             self.sending_thread.join(timeout)
             return not self.sending_thread.is_alive()
 
