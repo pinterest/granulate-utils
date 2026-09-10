@@ -14,7 +14,7 @@
 # limitations under the License.
 #
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Dict, List, Optional
 
@@ -44,6 +44,10 @@ class Container:
     process: Optional[psutil.Process]
     # None if not requested, make sure to pass all_info=True
     time_info: Optional[TimeInfo]
+    # Pod-sandbox (pod-level) labels for CRI containers; empty for Docker and when
+    # the sandbox could not be resolved. Kept separate from `labels` (which holds
+    # container-level labels) so existing consumers of `labels` are unaffected.
+    pod_labels: Dict[str, str] = field(default_factory=dict)
 
 
 class ContainersClientInterface:

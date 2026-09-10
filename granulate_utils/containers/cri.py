@@ -74,18 +74,46 @@ class _Client:
 
         containers = []
         with self.stub() as stub:
+            sandbox_labels = self._list_sandbox_labels(stub)
             for runtime_container in stub.ListContainers(
                 self.api.api_pb2.ListContainersRequest(filter=container_filter)
             ).containers:
                 if all_info:
-                    container = self._get_container(stub, runtime_container.id, verbose=True)
+                    container = self._get_container(
+                        stub, runtime_container.id, verbose=True, sandbox_labels=sandbox_labels
+                    )
                     if container is not None:
                         containers.append(container)
                 else:
-                    containers.append(self._create_container(runtime_container, None))
+                    containers.append(self._create_container(runtime_container, None, sandbox_labels))
         return containers
 
-    def _get_container(self, stub, container_id: str, *, verbose: bool) -> Optional[Container]:
+    def _list_sandbox_labels(self, stub) -> Dict[str, Dict[str, str]]:
+        """Map pod UID -> pod-sandbox (pod-level) labels for the current node.
+
+        Pod labels live on the sandbox, not on the container, so we fetch them once
+        per listing and attach them to each container via its pod UID. Best-effort:
+        on any RPC error we return an empty map and callers fall back gracefully.
+        """
+        labels_by_pod_uid: Dict[str, Dict[str, str]] = {}
+        try:
+            response = stub.ListPodSandbox(self.api.api_pb2.ListPodSandboxRequest())
+        except grpc.RpcError:
+            return labels_by_pod_uid
+        for sandbox in response.items:
+            pod_uid = sandbox.metadata.uid
+            if pod_uid:
+                labels_by_pod_uid[pod_uid] = dict(sandbox.labels)
+        return labels_by_pod_uid
+
+    def _get_container(
+        self,
+        stub,
+        container_id: str,
+        *,
+        verbose: bool,
+        sandbox_labels: Optional[Dict[str, Dict[str, str]]] = None,
+    ) -> Optional[Container]:
         try:
             status_response = stub.ContainerStatus(
                 self.api.api_pb2.ContainerStatusRequest(container_id=container_id, verbose=verbose)
@@ -96,16 +124,18 @@ class _Client:
             raise
         else:
             pid: Optional[int] = json.loads(status_response.info.get("info", "{}")).get("pid")
-            return self._create_container(status_response.status, pid)
+            return self._create_container(status_response.status, pid, sandbox_labels)
 
     def get_container(self, container_id: str, all_info: bool) -> Optional[Container]:
         with self.stub() as stub:
-            return self._get_container(stub, container_id, verbose=all_info)
+            sandbox_labels = self._list_sandbox_labels(stub)
+            return self._get_container(stub, container_id, verbose=all_info, sandbox_labels=sandbox_labels)
 
     def _create_container(
         self,
         container,
         pid: Optional[int],
+        sandbox_labels: Optional[Dict[str, Dict[str, str]]] = None,
     ) -> Container:
         time_info: Optional[TimeInfo] = None
         if isinstance(container, self.api.api_pb2.ContainerStatus):
@@ -123,6 +153,9 @@ class _Client:
             with suppress(psutil.NoSuchProcess):
                 process = psutil.Process(pid)
 
+        pod_uid = container.labels.get("io.kubernetes.pod.uid")
+        pod_labels = (sandbox_labels or {}).get(pod_uid, {}) if pod_uid else {}
+
         return K8sContainer(
             runtime=self.runtime_name,
             name=self._reconstruct_name(container),
@@ -132,6 +165,7 @@ class _Client:
             process=process,
             time_info=time_info,
             annotations=container.annotations,
+            pod_labels=pod_labels,
         )
 
 
